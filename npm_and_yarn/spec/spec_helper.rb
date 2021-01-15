@@ -30,6 +30,7 @@ class ProjectFixtureBuilder
   ).freeze
 
   FIXTURE_NAMES = MANIFEST_FIXTURE_LETS | LOCKFILE_FIXTURE_LETS
+  FILE_NAMES = %i(files dependency_files)
 
   def self.example_group
     RSpec::Core::ExampleGroup
@@ -38,16 +39,23 @@ class ProjectFixtureBuilder
   def example_group.let(name, &block)
     super(name, &block)
 
-    ProjectFixtureBuilder.prepend_behavior(self, name) do |metadata|
+    ProjectFixtureBuilder.prepend_behavior(self, name) do |metadata, evaluated_block|
       # puts name
       # puts caller_locations(1..1).first
       # puts block.source_location
 
       key = ExampleGroupData.key(metadata)
       data = ProjectFixtureBuilder.storage.fetch(key) { ExampleGroupData.new(metadata) }
-      if FIXTURE_NAMES.include?(name.to_sym)
-        fixture_name = block.call
-        data.add_fixture_name(fixture_name)
+      if FILE_NAMES.include?(name.to_sym)
+        # In this case, the block will return an array of files
+        files = evaluated_block
+
+        files.each do |file|
+          data.add_file(file) if file.is_a?(Dependabot::DependencyFile)
+        end
+      elsif FIXTURE_NAMES.include?(name.to_sym)
+        # In this case, the block will return an array of fixture names
+        data.add_fixture_name(evaluated_block)
       end
       ProjectFixtureBuilder.current_group = data
       ProjectFixtureBuilder.storage[key] = data
@@ -58,30 +66,20 @@ class ProjectFixtureBuilder
     original_method = scope.instance_method(method_name)
 
     scope.__send__(:define_method, method_name) do |*args, &block|
-      yield self.class.metadata
+      evaluated_block = original_method.bind(self).call(*args, &block)
+      yield self.class.metadata, evaluated_block
 
       original_method.bind(self).call(*args, &block)
     end
   end
 
   class ExampleGroupData
-    attr_reader :metadata, :fixture_names, :fixture_paths
+    attr_reader :metadata, :files, :fixture_names
 
     def initialize(metadata)
       @metadata = metadata
+      @files = Set[]
       @fixture_names = Set[]
-      @fixture_paths = Set[]
-    end
-
-    def explain
-      msg = String.new("#{metadata[:full_description]} (#{metadata[:location]}) uses fixtures: #{fixture_names.to_a.join(', ')}\n")
-      fixture_paths.each do |path|
-        msg << "\ncp #{path} #{new_project_folder}"
-      end
-
-      msg << "\n\nAdd `let(:project_name) { \"#{project_name}\" }` to the #{metadata[:description]} block"
-
-      msg
     end
 
     def self.key(metadata)
@@ -92,24 +90,69 @@ class ProjectFixtureBuilder
       @fixture_names << name
     end
 
-    def add_fixture_path(path)
-      @fixture_paths << path
-    end
-
-    def new_project_folder
-      "npm_and_yarn/spec/fixtures/projects/#{project_name}"
+    def add_file(file)
+      @files << file
     end
 
     def project_name
-      @fixture_names.to_a.map { |f| File.basename(f, File.extname(f)) }.join("-")
+      @fixture_names.to_a.map { |f| File.basename(f, File.extname(f)) }.join("_")
     end
+  end
+end
+
+class ProjectBuilder
+  attr_reader :data
+
+  BASE_FOLDER = "npm_and_yarn/spec/fixtures/projects/"
+
+  def initialize(data)
+    @data = data
+  end
+
+  def run
+    project_dir = FileUtils.mkdir_p(File.join(BASE_FOLDER, subfolder, data.project_name)).last
+    Dir.chdir(project_dir) do
+      data.files.each do |file|
+        if file.directory == "/"
+          File.write(file.name, file.content)
+        else
+          subdir = FileUtils.mkdir(file.directory).last
+          Dir.chdir(subdir) { File.write(file.name, file.content) }
+        end
+      end
+    end
+
+    project_dir
+  end
+
+  def subfolder
+    if yarn_lock? && package_lock?
+      "generic"
+    elsif yarn_lock?
+      "yarn"
+    elsif package_lock?
+      "npm6"
+    else
+      "generic"
+    end
+  end
+
+  def yarn_lock?
+    data.files.map(&:name).include?("yarn.lock")
+  end
+
+  def package_lock?
+    data.files.map(&:name).include?("package-lock.json")
   end
 end
 
 RSpec.configure do |c|
   c.after do
     ProjectFixtureBuilder.storage.each do |_, data|
-      puts data.explain
+      dir = ProjectBuilder.new(data).run
+
+      puts "Created fixtures for `#{data.metadata[:full_description]}` (#{data.metadata[:location]}) in #{dir}"
+      puts "Add `let(:project_name) { \"#{data.project_name}\" }` to that example group"
     end
   end
 end
